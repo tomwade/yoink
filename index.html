@@ -1,0 +1,556 @@
+<html lang="en">
+   <head>
+      <title>Yoink Club</title>
+
+      <meta charset="utf-8">
+
+      <script src="https://code.jquery.com/jquery-3.6.0.min.js" integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4=" crossorigin="anonymous"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.5.2/ethers.umd.min.js" integrity="sha512-PtOcu3WZTldHT+VjAJdWV5ss+iGebEgc1h5olJuxUNPvKuC0VOZsk1UhNgQYi5oIyrNHhdIOw8WQMdZwBv1MyQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+      <script>
+         let provider;
+         let signer;
+         let contract;
+         let signed_contract;
+         let connected_address;
+
+         let yoinks = 0;
+
+         // Mappings of the unlock nfts
+         let nft_mapping = {
+            'rarebunniclub': {
+               'contract': '0x88b48f654c30e99bc2e4a1559b4dcf1ad93fa656',
+               'tokenId': '33270749855442626712268708349589625653006129619195728102046148969978191151105'
+            }
+         }
+
+         // Set the required number of token confirmation
+         const TX_CONFIRMATIONS = 1;
+         const SUCCESS_SLEEP = 5000;
+         const ASSET_COUNT = 10;
+
+         // Set up some constant contract addresses
+         const WETH_CONTRACT = '0xc778417E063141139Fce010982780140Aa0cD5Ab';
+         const NFTX_ZAP_CONTRACT = '0xF83d27657a6474cB2Ae09a5b39177BBB80E63d81';
+
+         // Our set of testing Token IDs that we use to swap and sell. We need to do
+         // this so we can query values that have been bought, swapped and sold.
+         const TOKEN_SET_A = ['728', '727', '726', '725', '724'];
+         const TOKEN_SET_B = ['736', '737', '738', '739', '744'];
+
+         // Set our fallback utility value
+         const FALLBACK_UTILITY_VALUE = 410
+
+         // Used to capture the traits of our NFT if we have ownership
+         let token_traits = {}
+
+         // The ERC-721 Contract ABI, which is a common contract interface
+         // for tokens (this is the Human-Readable ABI format)
+         const rarebunniclub_abi = [
+           "function calculateRewards(address _contract, uint256[] _tokenIds) public view",
+           "function claimRewards(address _contractAddress, uint256[] _tokenIds) public payable"
+         ];
+
+         const nftx_abi = [
+           "function buyAndSwap721(uint256 vaultId, uint256[] idsIn, uint256[] specificIds, address[] path, address to) public payable",
+           "function mintAndSell721(uint256 vaultId, uint256[] ids, uint256 minWethOut, address[] path, address to) public payable"
+         ];
+
+         let erc1155_abi = [
+            "function balanceOf(address account, uint256 id) public view returns (uint256)",
+            "function uri(uint256 id) public view returns (string)"
+         ];
+
+         let erc721_abi = [
+            "function mint(address to, uint256 tokenId) external",
+            "function setApprovalForAll(address operator, bool _approved) external"
+         ];
+
+         let assets;
+         let tokenIds = [];
+         let swappedTokenIds = [];
+
+         let os_floor;
+         let nftx_sale_floor;
+
+         async function connect_mainnet() {
+         	// A Web3Provider wraps a standard Web3 provider, which is
+         	// what MetaMask injects as window.ethereum into each page
+         	try {
+         		provider = new ethers.providers.Web3Provider(window.ethereum)
+         	} catch (error) {
+         		alert('Unable to connect to provider. Please install MetaMask and try again.');
+         		console.error(error);
+         		return
+         	}
+
+         	await provider.send("eth_requestAccounts", [])
+         
+         	// The MetaMask plugin also allows signing transactions to
+         	// send ether and pay to change state within the blockchain.
+         	// For this, you need the account signer...
+         	signer = provider.getSigner();
+         }
+         
+         async function init() {
+         	// A Web3Provider wraps a standard Web3 provider, which is
+         	// what MetaMask injects as window.ethereum into each page
+         	await connect_mainnet();
+         
+         	if (!provider || !signer) {
+         		return show_screen('no-wallet');
+         	}
+
+         	connected_address = await signer.getAddress()
+         
+         	// Get the balance of an account (by address or ENS name, if supported by network)
+         	balance = await provider.getBalance(connected_address)
+
+            // Verify that our user owns the expected NFT
+            let nft = await verify_nft_ownership('rarebunniclub');
+            if (!nft) {
+               return show_screen('no-nft')
+            }
+
+            // We have confirmed ownership of the NFT, so we can load in our traits for
+            // our configurable variables.
+            let response = await fetch(`https://testnets-api.opensea.io/api/v1/asset/${nft_mapping['rarebunniclub']['contract']}/${nft_mapping['rarebunniclub']['tokenId']}/`, {
+               method: 'GET',
+               cache: 'no-cache',
+            });
+
+            // Inject NFT traits
+            nft_json = await response.json();
+            nft_json['traits'].forEach(trait => {
+               token_traits[trait['trait_type']] = trait['value'];
+               $('.token-' + trait['trait_type']).text(trait['value']);
+            })
+
+            // Set our loading screen message
+            $('#loading h3').text('Searching for carrot smugglers');
+            show_screen('loading');
+
+            await load_floor_prices();
+            await load_opensea_assets();
+         }
+
+         async function load_floor_prices() {
+   			let response = await fetch('https://api.opensea.io/api/v1/collection/rarebunniclub?format=json', {
+   				method: 'GET',
+   				cache: 'no-cache',
+   			});
+
+			   let os_json = await response.json();
+
+			   // Get the floor price
+			   os_floor = os_json['collection']['stats']['floor_price'];
+
+			   // Get the NFTX sale floor price
+			   nftx_sale_floor = 0.1162;
+
+            console.log(`Open Sea Floor: ${os_floor}`);
+            console.log(`NFTX Floor: ${nftx_sale_floor}`);
+         }
+
+         async function load_opensea_assets() {
+			   // Get all NFT below the sale price on NFTX
+            let response = await fetch('http://localhost:3000', {
+               method: 'GET',
+               cache: 'no-cache',
+            });
+
+            let all_assets = await response.json();
+
+            // Load our available utility
+            assets = await available_utility(all_assets);
+            if (assets.length > ASSET_COUNT) {
+               assets = assets.slice(0, ASSET_COUNT)
+            }
+
+            let total_asset_cost = 0;
+
+            // Get a list of our token IDs that we are working with
+            for (let i = 0; i < assets.length; i++) {
+               $('#opensea-assets').append('<li data-token="' + assets[i]["tokenId"] + '"><a href="' + assets[i]["offerUrl"] + '" target="_blank"><img src="' + assets[i]["displayImageUrl"] + '" class="asset-image" /></a><span class="asset-utility"><strong class="token-icon">🥕</strong> ' + assets[i]["utility_available"] + '</span></li>')
+
+               tokenIds.push(assets[i]['tokenId']);
+
+               total_asset_cost += assets[i]['floorPrice']['amount'];
+            }
+
+            $('#total-asset-cost').text(parseFloat(total_asset_cost.toFixed(4)));
+            $('#total-asset-resale').text(parseFloat((assets.length * nftx_sale_floor).toFixed(4)));
+
+            show_screen('input-select');
+         }
+
+         async function available_utility(assets) {
+            // Connect to our RBC staking contract
+            public_rbc_contract = new ethers.Contract(token_traits['stake'], rarebunniclub_abi, provider);
+            signed_rbc_contract = public_rbc_contract.connect(signer);
+
+            unclaimed_carrots = await public_rbc_contract.calculateRewards(token_traits['nft'], tokenIds);
+
+            // Query the number of carrots available for each NFT
+            for (let i = 0; i < assets.length; i++) {
+               assets[i]['utility_available'] = unclaimed_carrots[i] ? unclaimed_carrots[i] : FALLBACK_UTILITY_VALUE;
+            }
+
+            return assets
+         }
+
+         async function claim_utility(_tokenIds) {
+            // Connect to our RBC staking contract
+            public_rbc_contract = new ethers.Contract(token_traits['stake'], rarebunniclub_abi, provider);
+            signed_rbc_contract = public_rbc_contract.connect(signer);
+
+            let tx = await signed_rbc_contract.claimRewards(token_traits['nft'], _tokenIds);
+            await tx.wait(TX_CONFIRMATIONS)
+         }
+
+         async function opensea_buy() {
+            /*
+            Redacted during Rinkeby testing. Will add back in soon.
+            */
+         }
+
+         async function opensea_mint() {
+            // Connect to our RBC staking contract
+            public_rbc_contract = new ethers.Contract(token_traits['nft'], erc721_abi, provider);
+
+            let start_id = 770;
+            let txs = []
+            let new_token_ids = [];
+
+            for (let i = 0; i < assets.length; i++) {
+               let mint_token_id = start_id + i;
+               let tx = await public_rbc_contract.connect(signer).mint(connected_address, mint_token_id)
+               txs.push(tx.wait(TX_CONFIRMATIONS))
+               new_token_ids.push(mint_token_id)
+            }
+
+            await Promise.all(txs)
+
+            tokenIds = new_token_ids;
+         }
+
+         async function nftx_swap() {
+            // Connect to our NFTX staking contract
+            public_nftx_contract = new ethers.Contract(NFTX_ZAP_CONTRACT, nftx_abi, provider);
+            signed_nftx_contract = public_nftx_contract.connect(signer);
+
+            const x = new ethers.Contract(token_traits['nft'], erc721_abi);
+            let tx = await x.connect(signer).setApprovalForAll(NFTX_ZAP_CONTRACT, true);
+            await tx.wait(TX_CONFIRMATIONS)
+
+            let price = tokenIds.length * 0.05;
+
+            tx = await signed_nftx_contract.buyAndSwap721(
+               token_traits['nftx_vault_id'],
+               tokenIds,
+               [],
+               [WETH_CONTRACT, token_traits['nftx']],
+               connected_address,
+               {value: ethers.utils.parseEther(String(price))}
+            );
+            await tx.wait(TX_CONFIRMATIONS)
+
+            // TODO: Update list of token IDs that were gained from the swap
+            // swappedTokenIds = TOKEN_SET_A;
+         }
+
+         async function nftx_sell() {
+            // Connect to our NFTX staking contract
+            public_nftx_contract = new ethers.Contract(NFTX_ZAP_CONTRACT, nftx_abi, provider);
+            signed_nftx_contract = public_nftx_contract.connect(signer);
+
+            const x = new ethers.Contract(token_traits['nft'], erc721_abi);
+            let tx = await x.connect(signer).setApprovalForAll(NFTX_ZAP_CONTRACT, true);
+            await tx.wait(TX_CONFIRMATIONS)
+
+            return;
+
+            tx = await signed_nftx_contract.mintAndSell721(
+               token_traits['nftx_vault_id'],
+               tokenIds,
+               ethers.utils.parseEther(String(nftx_sale_floor * assets.length)),
+               [token_traits['nftx'], WETH_CONTRACT],
+               connected_address
+            )
+            await tx.wait(TX_CONFIRMATIONS)
+         }
+
+         async function verify_nft_ownership() {
+            const contract = new ethers.Contract(nft_mapping['rarebunniclub']['contract'], erc1155_abi, provider);
+            return parseInt(await contract.balanceOf(connected_address, nft_mapping['rarebunniclub']['tokenId'])) > 0;
+         }
+
+         async function harvest() {
+            show_screen('processing');
+
+            set_processing_emoji('🧹');
+            set_processing_message(`Yoinking ${assets.length} ${token_traits['asset_name']}..`);
+
+            // Buy the tokens from OS
+            // await opensea_buy();
+            await opensea_mint();
+
+            set_processing_emoji('🙌');
+            set_processing_message(`${assets.length} ${token_traits['asset_name']} yoinked!`);
+            await sleep(SUCCESS_SLEEP);
+
+            set_processing_emoji('👨‍🌾');
+            set_processing_message(`Yoinking first batch of ${token_traits['utility_name']}..`);
+
+            // Once all have been purchased, claim carrots
+            await claim_utility(tokenIds);
+
+            set_processing_emoji('🙌');
+            set_processing_message(`${FALLBACK_UTILITY_VALUE * assets.length} ${token_traits['utility_name']} yoinked!`);
+            await sleep(SUCCESS_SLEEP);
+
+            // Once claimed, swap on NFTX
+            set_processing_emoji('🧹💨');
+            set_processing_message(`Swapping ${token_traits['asset_name']} on NFTX..`);
+            await nftx_swap();
+
+            set_processing_emoji('🙌');
+            set_processing_message(`${assets.length} ${token_traits['asset_name']} swapped on NFTX!`);
+            await sleep(SUCCESS_SLEEP);
+
+            // Once swapped, claim carrots of new IDs
+            if (swappedTokenIds.length) {
+               set_processing_emoji('👨‍🌾');
+               set_processing_message(`Yoinking second batch of ${token_traits['utility_name']}..`);
+               await claim_utility(swappedTokenIds);
+
+               set_processing_emoji('🙌');
+               set_processing_message(`Another ${FALLBACK_UTILITY_VALUE * assets.length} ${token_traits['utility_name']} yoinked!`);
+               await sleep(SUCCESS_SLEEP);
+
+               tokenIds = swappedTokenIds
+            }
+
+            // Sell our assets to NFTX
+            set_processing_emoji('💰');
+            set_processing_message(`Selling ${assets.length} ${token_traits['asset_name']} on NFTX..`);
+            await nftx_sell();
+
+            set_processing_emoji('🙌');
+            set_processing_message(`Your ${token_traits['asset_name']} sold for ${(nftx_sale_floor * assets.length)} Ξ`);
+            await sleep(SUCCESS_SLEEP);
+
+            location.reload();
+         }
+
+         init();
+
+         function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+         }
+
+         function show_screen(screen) {
+            $('.screen').fadeOut(function () {
+               $(`#${screen}`).show();
+            });
+         }
+
+         function set_processing_message(message) {
+            $('#processing h3').text(message);
+         }
+
+         function set_processing_emoji(emoji) {
+            $('#processing span').text(emoji);
+         }
+      </script>
+
+      <style>
+      body {
+         padding: 0;
+         margin: 0;
+
+         font-family: Verdana, Geneva, sans-serif;
+      }
+
+      h1 {
+         background-color: #EA4C89;
+         color: white;
+         font-family: Verdana, Geneva, sans-serif;
+         text-align: center;
+
+         padding: 2rem;
+         margin: 0;
+      }
+
+      h3, h4 {
+         font-family: Verdana, Geneva, sans-serif;
+      }
+
+      .screen {
+         display: none;
+      }
+
+      .screen--icon {
+      }
+
+      .screen--icon > div {
+         display: flex;
+         flex-direction: column;
+         justify-content: center;
+         align-items: center;
+         min-height: 100vh;
+         min-width: 100vw;
+         text-align: center;
+      }
+
+      .screen--icon > div > span {
+         font-size: 128px;
+      }
+
+      ul.assets {
+         display: flex;
+         flex-wrap: wrap;
+         padding: 0;
+         margin: 0;
+      }
+
+      ul.assets li {
+         flex: 20%;
+         max-width: 20%;
+         padding: 0;
+         position: relative;
+         list-style: none;
+      }
+
+      ul.assets img {
+         display: block;
+         max-width: 100%;
+         height: auto;
+      }
+
+      ul.assets span {
+         position: absolute;
+         top: 0;
+         left: 0;
+         background: white;
+         padding: 4px 8px;
+         font-size: 1.4rem;
+      }
+
+      #calculation {
+         background-color: #EA4C89;
+
+         display: flex;
+         flex-direction: row;
+      }
+
+      #calculation span {
+         color: white;
+         width: 25%;
+         line-height: 3rem;
+         padding: 1rem;
+         text-align: center;
+         font-family: Verdana, Geneva, sans-serif;
+         font-weight: bold;
+      }
+
+      .actions {
+         padding: 3rem 0;
+         text-align: center;
+      }
+
+      .actions button {
+         background-color: #EA4C89;
+         border-radius: 8px;
+         border-style: none;
+         box-sizing: border-box;
+         color: #FFFFFF;
+         cursor: pointer;
+         display: inline-block;
+         font-family: "Haas Grot Text R Web", "Helvetica Neue", Helvetica, Arial, sans-serif;
+         font-size: 32px;
+         font-weight: 500;
+         line-height: 1.4em;
+         list-style: none;
+         margin: 0;
+         outline: none;
+         padding: 0.5em 1em;
+         position: relative;
+         text-align: center;
+         text-decoration: none;
+         transition: color 100ms;
+         vertical-align: baseline;
+         user-select: none;
+         -webkit-user-select: none;
+         touch-action: manipulation;
+      }
+
+      .actions button:hover,
+      .actions button:focus {
+         background-color: #F082AC;
+      }
+      </style>
+   </head>
+   <body>
+      <div id="connect-wallet" class="screen screen--icon" style="display: block">
+         <div>
+            <span>🦊</span>
+            <h3>Connect your MetaMask wallet to begin</h3>
+         </div>
+      </div>
+
+      <div id="no-wallet" class="screen screen--icon">
+         <div>
+            <span>🤷‍♂️</span>
+            <h3>Unable to connect to wallet</h3>
+         </div>
+      </div>
+
+      <div id="no-nft" class="screen screen--icon">
+         <div>
+            <span>🙈</span>
+            <h3>No Yoink.club NFT in wallet</h3>
+            <h4>Find them on <a href="#">OpenSea</a></h4>
+         </div>
+      </div>
+
+      <div id="loading" class="screen screen--icon">
+         <div>
+            <span>🕵️‍♂️</span>
+            <h3></h3>
+         </div>
+      </div>
+
+      <div id="input-select" class="screen">
+         <h1>The following <strong>10</strong> <span class="token-asset_name"></span> will be purchased</h1>
+         <ul id="opensea-assets" class="assets">
+
+         </ul>
+         <div id="calculation">
+            <span>Asset Cost: <span id="total-asset-cost">0.78</span> Ξ</span>
+            <span>NFTX Swap Cost: <span>0.25</span> Ξ</span>
+            <span>Asset Resale: <span id="total-asset-resale">1.014</span> Ξ</span>
+            <span>Utility Claimable: <span>8,200</span> <span class="token-icon">🥕</span></span>
+         </div>
+         <div class="actions">
+            <button id="confirm-assets">Yoink 'em!</button>
+         </div>
+      </div>
+
+      <div id="processing" class="screen screen--icon">
+         <div>
+            <span>👨‍🌾</span>
+            <h3>Harvesting <span class="token-utility_name"></span></h3>
+         </div>
+      </div>
+
+      <div id="output-display" class="screen">
+
+      </div>
+
+      <script>
+      $('#confirm-assets').click(function () {
+         harvest();
+      });
+      </script>
+   </body>
+</html>
